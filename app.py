@@ -54,6 +54,9 @@ DATA_DIR = os.getenv("DATA_DIR", "data")
 # Model
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
+# 觸發字：群組/聊天室只在看到這些才回
+TRIGGERS = ["@宋家萬事興", "/bot"]
+
 
 def _present(v: str | None) -> bool:
     return bool(v and v.strip())
@@ -185,7 +188,6 @@ def gh_get_file(path_in_repo: str) -> tuple[str | None, str | None]:
         sha = data.get("sha")
         if not content_b64:
             return "", sha
-        # GitHub 會用換行分段 base64
         content_b64 = content_b64.replace("\n", "")
         text = base64.b64decode(content_b64).decode("utf-8", errors="replace")
         return text, sha
@@ -213,7 +215,6 @@ def append_to_daily_journal(lines_to_append: list[str]):
     在 repo 的 journal/YYYY-MM-DD.md 追加內容（不存在就建立）
     """
     if not github_enabled():
-        # 沒有設 GitHub 變數也不算錯，只是 journal 不會寫進 repo
         print("GitHub not configured; skip journal upload.")
         return
 
@@ -223,13 +224,12 @@ def append_to_daily_journal(lines_to_append: list[str]):
     existing, sha = gh_get_file(path_in_repo)
 
     if existing is None:
-        # 新檔：加標題
-        base = [f"# {ymd}", ""]
+        # 新檔：加標題一次
+        base = [f"# {ymd}", "", "## LINE 對話", ""]
         new_text = "\n".join(base + lines_to_append).rstrip() + "\n"
         gh_put_file(path_in_repo, new_text, message=f"daily: {ymd}")
         return
 
-    # 舊檔：直接 append（確保前面有換行）
     existing_text = existing
     if not existing_text.endswith("\n"):
         existing_text += "\n"
@@ -294,34 +294,50 @@ async def line_webhook(
 def handle_text_message(event: MessageEvent):
     user_text = (event.message.text or "").strip()
 
+    source = event.source
+    chat_type = getattr(source, "type", "unknown")  # user / group / room
+
     # 1) 本機記錄（可留可不留）
     log_line_message_local(event, user_text)
 
-    # 2) 先寫入 GitHub journal（使用者訊息）
+    # 2) 先寫入 GitHub journal（使用者訊息，包含來源）
     try:
         append_to_daily_journal([
-            "## LINE 對話",
-            f"- [{now_hm()}] Sonya: {user_text}",
+            f"- [{now_hm()}] ({chat_type}) Sonya: {user_text}",
         ])
     except Exception as e:
         print(f"append user to journal failed: {type(e).__name__}: {e}")
 
-    # help 指令
+    # 3) 回覆策略：群組/聊天室只有觸發才回
+    should_reply = True
+    if chat_type in ("group", "room"):
+        should_reply = any(t in user_text for t in TRIGGERS)
+
+    if not should_reply:
+        return
+
+    # 4) help 指令
     if user_text.lower() in ["/help", "help"]:
         reply_text = (
-            "Sonya 生活庶務助手已啟動。\n"
+            "宋家萬事興已啟動。\n"
             "\n"
-            "目前功能：\n"
-            "• Gemini AI 對話\n"
-            "• 每則訊息直接寫入 GitHub journal\n"
+            "規則：\n"
+            "• 私訊：每句回覆\n"
+            "• 群組/聊天室：只有叫我（@宋家萬事興 或 /bot）才回\n"
             "\n"
             "指令：\n"
             "• /help 顯示說明\n"
         )
     else:
-        reply_text = gemini_reply(user_text)
+        # 群組/聊天室：去掉觸發字再送 Gemini
+        cleaned = user_text
+        if chat_type in ("group", "room"):
+            for t in TRIGGERS:
+                cleaned = cleaned.replace(t, "").strip()
+        prompt = cleaned if cleaned else user_text
+        reply_text = gemini_reply(prompt)
 
-    # 3) 回覆給 LINE
+    # 5) 回覆給 LINE
     try:
         messaging_api.reply_message(
             ReplyMessageRequest(
@@ -332,7 +348,7 @@ def handle_text_message(event: MessageEvent):
     except Exception as e:
         print(f"Reply failed: {type(e).__name__}: {e}")
 
-    # 4) 再把機器人回覆也寫入 GitHub journal
+    # 6) 再把機器人回覆也寫入 GitHub journal
     try:
         append_to_daily_journal([
             f"- [{now_hm()}] Bot: {reply_text}",
