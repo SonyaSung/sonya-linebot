@@ -1,13 +1,10 @@
 # app.py
-# deploy bump 2026-02-18 09:xx
-
 import os
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import JSONResponse
 
+# Only load .env locally. On Railway, use Variables.
 from dotenv import load_dotenv
-
-# 本機開發才會用 .env；Railway 會用 Variables
 if os.path.exists(".env"):
     load_dotenv()
 
@@ -18,27 +15,34 @@ from linebot.v3.messaging import (
     Configuration,
     MessagingApi,
     ReplyMessageRequest,
-    TextMessage
+    TextMessage,
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
-# Gemini (google-genai)
+# Google Gen AI SDK (google-genai)
 from google import genai
+from google.genai import errors as genai_errors
 
 # -------------------------
-# Env vars (IMPORTANT)
+# Env vars
 # -------------------------
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# 可選：在 Railway Variables 設 GEMINI_MODEL
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+# Model: set in Railway Variables if you want; default here
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET or not GEMINI_API_KEY:
-    raise RuntimeError(
-        "Missing env vars. Please set LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, GEMINI_API_KEY."
-    )
+def _present(v: str | None) -> bool:
+    return bool(v and v.strip())
+
+if not (_present(LINE_CHANNEL_ACCESS_TOKEN) and _present(LINE_CHANNEL_SECRET) and _present(GEMINI_API_KEY)):
+    # Don't print secrets. Only indicate which is missing.
+    missing = []
+    if not _present(LINE_CHANNEL_ACCESS_TOKEN): missing.append("LINE_CHANNEL_ACCESS_TOKEN")
+    if not _present(LINE_CHANNEL_SECRET): missing.append("LINE_CHANNEL_SECRET")
+    if not _present(GEMINI_API_KEY): missing.append("GEMINI_API_KEY")
+    raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
 
 # -------------------------
 # App init
@@ -60,12 +64,15 @@ def gemini_reply(user_text: str) -> str:
     try:
         resp = genai_client.models.generate_content(
             model=GEMINI_MODEL,
-            contents=user_text
+            contents=user_text,
         )
         text = (resp.text or "").strip()
-        if not text:
-            return "我有收到你的訊息，但模型這次沒有回傳內容。你可以換個問法再試一次。"
-        return text
+        return text if text else "我有收到你的訊息，但這次模型沒有回傳內容。你可以換個問法再試一次。"
+
+    except genai_errors.APIError as e:
+        # Typical: wrong model name (404), auth (401), quota (429)...
+        return f"AI 呼叫失敗：{e.code} {e.message}"
+
     except Exception as e:
         return f"AI 呼叫失敗：{type(e).__name__}: {e}"
 
@@ -84,7 +91,7 @@ def root():
 @app.post("/line/webhook")
 async def line_webhook(
     request: Request,
-    x_line_signature: str | None = Header(default=None, alias="X-Line-Signature")
+    x_line_signature: str | None = Header(default=None, alias="X-Line-Signature"),
 ):
     if not x_line_signature:
         raise HTTPException(status_code=400, detail="Missing X-Line-Signature header")
@@ -109,7 +116,7 @@ def handle_text_message(event: MessageEvent):
     if user_text.lower() in ["/help", "help"]:
         reply_text = (
             "可以直接傳文字給我，我會用 Gemini 回覆。\n"
-            "（要改模型：在 Railway Variables 設 GEMINI_MODEL，例如 gemini-1.5-pro）"
+            "你也可以在 Railway Variables 設定 GEMINI_MODEL（例如 gemini-2.5-flash）。"
         )
     else:
         reply_text = gemini_reply(user_text)
@@ -118,7 +125,7 @@ def handle_text_message(event: MessageEvent):
         messaging_api.reply_message(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
-                messages=[TextMessage(text=reply_text)]
+                messages=[TextMessage(text=reply_text)],
             )
         )
     except Exception as e:
