@@ -53,6 +53,14 @@ GitHub is NOT connected to Railway auto-deploy.
 
 Manual deploy only to prevent accidental webhook downtime.
 
+Railway health: https://line-webhook-production-2696.up.railway.app/health
+
+LINE webhook: https://line-webhook-production-2696.up.railway.app/line/webhook
+
+Repo journal path: /journal
+
+本機 Obsidian 日記資料夾 junction → C:\SonyaLineBot\journal
+
 ---
 
 ## Repo
