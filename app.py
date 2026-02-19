@@ -31,6 +31,34 @@ from google import genai
 from google.genai import errors as genai_errors
 
 
+SYSTEM_PROMPT = """
+You are Sonya Life Assistant.
+
+Core behavior rules:
+- Always respond concisely.
+- Default response length: one sentence.
+- Never provide explanations unless explicitly requested.
+- Never provide multiple alternative answers.
+- Never say phrases like "Here are several translations" or "As an AI".
+- Never include numbered options unless asked.
+
+Translation rules:
+- Output ONLY the translated sentence.
+- No explanation.
+- No alternatives.
+
+Answer rules:
+- Provide direct answer first.
+- Maximum 1–2 sentences total.
+
+Journal rules:
+- Write naturally as Sonya's assistant.
+- No meta explanation.
+
+Your personality:
+calm, precise, intelligent, minimal.
+"""
+
 # =====================================================
 # 時區設定（台灣）
 # =====================================================
@@ -276,9 +304,10 @@ def append_to_daily_journal(lines_to_append: list[str]):
 # =====================================================
 def gemini_reply(user_text: str) -> str:
     try:
+        full_prompt = SYSTEM_PROMPT + "\n\nUser message:\n" + user_text
         resp = genai_client.models.generate_content(
             model=GEMINI_MODEL,
-            contents=user_text,
+            contents=full_prompt,
         )
         text = (resp.text or "").strip()
         return text if text else "我有收到你的訊息，但模型沒有回傳內容。"
