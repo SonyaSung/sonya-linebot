@@ -38,6 +38,21 @@ TZ_TAIPEI = timezone(timedelta(hours=8))
 
 
 # =====================================================
+# Build / identity (for debugging what code is running)
+# =====================================================
+APP_NAME = "sonya-linebot"
+APP_FILE = __file__
+# Railway 常見的 git sha env（不保證一定存在，所以用多個 fallback）
+APP_BUILD = (
+    os.getenv("RAILWAY_GIT_COMMIT_SHA")
+    or os.getenv("GIT_COMMIT_SHA")
+    or os.getenv("RAILWAY_COMMIT_SHA")
+    or "unknown"
+)
+APP_ENV = os.getenv("RAILWAY_ENVIRONMENT", os.getenv("ENV", "unknown"))
+
+
+# =====================================================
 # Env vars
 # =====================================================
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
@@ -47,6 +62,9 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # GitHub（用 Contents API 寫入 journal，避免 Railway 兩個 service 檔案系統不共享）
 GITHUB_REPO = os.getenv("GITHUB_REPO")  # e.g. "SonyaSung/sonya-linebot"
 GITHUB_PAT = os.getenv("GITHUB_PAT")    # fine-grained PAT with contents write
+
+# ⚠️ 建議：journal 另寫到 journal branch，避免 main 觸發 redeploy
+JOURNAL_BRANCH = os.getenv("JOURNAL_BRANCH", "main")  # 建議改成 "journal"
 
 # Railway 建議設 DATA_DIR=/data（本機可用 data）
 DATA_DIR = os.getenv("DATA_DIR", "data")
@@ -77,6 +95,23 @@ if missing:
 # App init
 # =====================================================
 app = FastAPI()
+
+# Print identity at startup (shows in Railway deploy logs)
+print(f"[{APP_NAME}] booting...")
+print(f"[{APP_NAME}] file={APP_FILE}")
+print(f"[{APP_NAME}] build={APP_BUILD} env={APP_ENV}")
+print(f"[{APP_NAME}] journal_branch={JOURNAL_BRANCH}")
+
+# Minimal request logging for Railway HTTP logs
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_ts = datetime.now(timezone.utc)
+    response = await call_next(request)
+    dur_ms = int((datetime.now(timezone.utc) - start_ts).total_seconds() * 1000)
+    print(
+        f'HTTP {request.method} {request.url.path} -> {response.status_code} {dur_ms}ms'
+    )
+    return response
 
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
@@ -203,7 +238,7 @@ def gh_put_file(path_in_repo: str, text: str, message: str, sha: str | None = No
     payload = {
         "message": message,
         "content": content_b64,
-        "branch": "main",
+        "branch": JOURNAL_BRANCH,
     }
     if sha:
         payload["sha"] = sha
@@ -224,7 +259,6 @@ def append_to_daily_journal(lines_to_append: list[str]):
     existing, sha = gh_get_file(path_in_repo)
 
     if existing is None:
-        # 新檔：加標題一次
         base = [f"# {ymd}", "", "## LINE 對話", ""]
         new_text = "\n".join(base + lines_to_append).rstrip() + "\n"
         gh_put_file(path_in_repo, new_text, message=f"daily: {ymd}")
@@ -265,7 +299,30 @@ def health():
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "Sonya LINE Bot"}
+    return {"ok": True, "service": "Sonya LINE Bot", "build": APP_BUILD}
+
+
+@app.get("/__whoami")
+def whoami():
+    return {
+        "app": APP_NAME,
+        "file": APP_FILE,
+        "build": APP_BUILD,
+        "env": APP_ENV,
+        "journal_branch": JOURNAL_BRANCH,
+    }
+
+
+@app.get("/routes")
+def routes():
+    # 顯示目前 FastAPI 註冊的所有路由（debug 用）
+    out = []
+    for r in app.router.routes:
+        methods = sorted(getattr(r, "methods", []) or [])
+        path = getattr(r, "path", "")
+        name = getattr(r, "name", "")
+        out.append({"methods": methods, "path": path, "name": name})
+    return {"count": len(out), "routes": out}
 
 
 @app.post("/line/webhook")
