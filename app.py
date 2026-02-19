@@ -59,6 +59,80 @@ Your personality:
 calm, precise, intelligent, minimal.
 """
 
+TRANSLATION_CONCISE_SYSTEM_PROMPT = """
+你是一個純翻譯引擎，不是老師、解說者或語言顧問。
+
+當使用者要求翻譯時，必須嚴格遵守以下規則：
+
+━━━━━━━━━━━━━━━━━━
+【輸出規則（強制）】
+━━━━━━━━━━━━━━━━━━
+
+只輸出最終翻譯結果。
+
+禁止輸出：
+
+- 解釋
+- 條列
+- 編號
+- 多個版本
+- 括號註解
+- 音標
+- Markdown
+- 前言
+- 結語
+- 說明文字
+- 「以下是翻譯」
+- 「翻譯如下」
+
+輸出只能包含：
+
+→ 一行純翻譯文字
+
+不得包含任何其他內容。
+
+━━━━━━━━━━━━━━━━━━
+【性別敬語規則（全語言適用）】
+━━━━━━━━━━━━━━━━━━
+
+若翻譯語言涉及性別敬語（例如泰文、日文、韓文、印尼文等）：
+
+一律使用：
+
+→ 女性說話者版本
+
+禁止：
+
+- 輸出男性版本
+- 同時輸出男女版本
+- 詢問使用者性別
+- 解釋性別差異
+
+除非使用者明確指定男性，否則永遠使用女性版本。
+
+━━━━━━━━━━━━━━━━━━
+【範例】
+
+使用者：
+請翻譯為泰文：今天我吃得很飽，你呢？
+
+正確輸出：
+วันนี้ฉันกินอิ่มมากค่ะ คุณล่ะคะ?
+
+錯誤輸出（禁止）：
+วันนี้ผมกินอิ่มมากครับ...
+วันนี้ฉันกินอิ่มมากค่ะ...
+（男性 / 女性版本）
+
+錯誤輸出（禁止）：
+以下是翻譯：
+วันนี้ฉันกินอิ่มมากค่ะ
+
+━━━━━━━━━━━━━━━━━━
+
+你必須永遠遵守這些規則。
+"""
+
 # =====================================================
 # 時區設定（台灣）
 # =====================================================
@@ -318,6 +392,26 @@ def gemini_reply(user_text: str) -> str:
         return f"AI 呼叫失敗：{type(e).__name__}: {e}"
 
 
+def gemini_translate_reply(user_text: str) -> str:
+    try:
+        resp = genai_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=user_text,
+            generation_config={
+                "temperature": 0.2,
+                "max_output_tokens": 80,
+            },
+            system_instruction=TRANSLATION_CONCISE_SYSTEM_PROMPT,
+        )
+        text = (resp.text or "").strip()
+        return text if text else "我有收到你的訊息，但模型沒有回傳內容。"
+
+    except genai_errors.APIError as e:
+        return f"AI 呼叫失敗：{e.code} {e.message}"
+    except Exception as e:
+        return f"AI 呼叫失敗：{type(e).__name__}: {e}"
+
+
 # =====================================================
 # Routes
 # =====================================================
@@ -379,6 +473,7 @@ async def line_webhook(
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text_message(event: MessageEvent):
     user_text = (event.message.text or "").strip()
+    is_translation = "翻譯" in user_text
 
     source = event.source
     chat_type = getattr(source, "type", "unknown")  # user / group / room
@@ -421,7 +516,10 @@ def handle_text_message(event: MessageEvent):
             for t in TRIGGERS:
                 cleaned = cleaned.replace(t, "").strip()
         prompt = cleaned if cleaned else user_text
-        reply_text = gemini_reply(prompt)
+        if is_translation:
+            reply_text = gemini_translate_reply(prompt)
+        else:
+            reply_text = gemini_reply(prompt)
 
     # 5) 回覆給 LINE
     try:
