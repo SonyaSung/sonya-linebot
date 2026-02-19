@@ -2,6 +2,8 @@
 import os
 import json
 import base64
+import random
+import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from urllib import request as urlrequest
@@ -173,6 +175,10 @@ DATA_DIR = os.getenv("DATA_DIR", "data")
 
 # Model
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_FALLBACK_MODEL_1 = os.getenv("GEMINI_FALLBACK_MODEL_1")
+GEMINI_FALLBACK_MODEL_2 = os.getenv("GEMINI_FALLBACK_MODEL_2")
+
+AI_BUSY_MESSAGE = "現在 AI 服務忙碌，我已收到你的訊息，請稍後再試一次。"
 
 # 觸發字：群組/聊天室只在看到這些才回
 TRIGGERS = ["@宋家萬事興", "/bot"]
@@ -376,40 +382,69 @@ def append_to_daily_journal(lines_to_append: list[str]):
 # =====================================================
 # Gemini 回覆
 # =====================================================
-def gemini_reply(user_text: str) -> str:
-    try:
-        full_prompt = SYSTEM_PROMPT + "\n\nUser message:\n" + user_text
-        resp = genai_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=full_prompt,
-        )
-        text = (resp.text or "").strip()
-        return text if text else "我有收到你的訊息，但模型沒有回傳內容。"
+def _is_retryable_error(err: Exception) -> bool:
+    if isinstance(err, TimeoutError):
+        return True
+    if isinstance(err, genai_errors.APIError):
+        return err.code in (429, 503)
+    return False
 
-    except genai_errors.APIError as e:
-        return f"AI 呼叫失敗：{e.code} {e.message}"
-    except Exception as e:
-        return f"AI 呼叫失敗：{type(e).__name__}: {e}"
+
+def call_gemini(
+    prompt: str,
+    system_instruction: str | None = None,
+    generation_config: dict | None = None,
+) -> str | None:
+    models = [GEMINI_MODEL, GEMINI_FALLBACK_MODEL_1, GEMINI_FALLBACK_MODEL_2]
+    models = [m for m in models if m]
+
+    backoffs = [0.8, 1.6, 3.2, 6.4]
+    last_error: Exception | None = None
+
+    for model in models:
+        for delay in backoffs:
+            try:
+                resp = genai_client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    generation_config=generation_config,
+                    system_instruction=system_instruction,
+                )
+                return (resp.text or "").strip()
+            except Exception as e:
+                last_error = e
+                if not _is_retryable_error(e):
+                    break
+                jitter = random.uniform(0.0, 0.2)
+                time.sleep(delay + jitter)
+        # try next fallback model
+        continue
+
+    if last_error:
+        print(f"Gemini call failed: {type(last_error).__name__}: {last_error}")
+    return None
+
+
+def gemini_reply(user_text: str) -> str:
+    full_prompt = SYSTEM_PROMPT + "\n\nUser message:\n" + user_text
+    text = call_gemini(full_prompt)
+    if text:
+        return text
+    return AI_BUSY_MESSAGE
 
 
 def gemini_translate_reply(user_text: str) -> str:
-    try:
-        resp = genai_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=user_text,
-            generation_config={
-                "temperature": 0.2,
-                "max_output_tokens": 80,
-            },
-            system_instruction=TRANSLATION_CONCISE_SYSTEM_PROMPT,
-        )
-        text = (resp.text or "").strip()
-        return text if text else "我有收到你的訊息，但模型沒有回傳內容。"
-
-    except genai_errors.APIError as e:
-        return f"AI 呼叫失敗：{e.code} {e.message}"
-    except Exception as e:
-        return f"AI 呼叫失敗：{type(e).__name__}: {e}"
+    text = call_gemini(
+        user_text,
+        system_instruction=TRANSLATION_CONCISE_SYSTEM_PROMPT,
+        generation_config={
+            "temperature": 0.2,
+            "max_output_tokens": 80,
+        },
+    )
+    if text:
+        return text
+    return AI_BUSY_MESSAGE
 
 
 # =====================================================
