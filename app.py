@@ -2,8 +2,8 @@
 import os
 import json
 import base64
-import random
 import time
+import re
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from urllib import request as urlrequest
@@ -135,6 +135,11 @@ TRANSLATION_CONCISE_SYSTEM_PROMPT = """
 你必須永遠遵守這些規則。
 """
 
+INDONESIAN_TRANSLATION_SYSTEM_PROMPT = (
+    "You are a translation engine. Output ONLY the final Indonesian translation. "
+    "No explanations, no options, no labels, no markdown, no extra lines."
+)
+
 # =====================================================
 # 時區設定（台灣）
 # =====================================================
@@ -178,7 +183,9 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_FALLBACK_MODEL_1 = os.getenv("GEMINI_FALLBACK_MODEL_1")
 GEMINI_FALLBACK_MODEL_2 = os.getenv("GEMINI_FALLBACK_MODEL_2")
 
-AI_BUSY_MESSAGE = "現在 AI 服務忙碌，我已收到你的訊息，請稍後再試一次。"
+AI_BUSY_GENERAL_MESSAGE = "（系統忙碌）我現在有點忙，請稍後再試一次。"
+AI_BUSY_TRANSLATION_MESSAGE = "（系統忙碌）請稍後再試。"
+AI_BUSY_MESSAGE = AI_BUSY_GENERAL_MESSAGE
 
 # 觸發字：群組/聊天室只在看到這些才回
 TRIGGERS = ["@宋家萬事興", "/bot"]
@@ -425,6 +432,42 @@ def call_gemini(
     return None
 
 
+def _is_keep_mode(text: str) -> bool:
+    return (
+        re.match(r"^\s*[#＃](keep|id)\b", text, re.IGNORECASE) is not None
+        or re.match(r"^\s*(記住|紀錄)[：:]", text) is not None
+    )
+
+
+def _match_id_translation_single(text: str) -> str | None:
+    m = re.match(r"^\s*請翻譯為印尼文[：:]\s*(.*)$", text)
+    return m.group(1).strip() if m else None
+
+
+def _match_id_translation_three(text: str) -> str | None:
+    m = re.match(r"^\s*請給我3種印尼文說法[：:]\s*(.*)$", text)
+    return m.group(1).strip() if m else None
+
+
+def _build_id_translation_prompt(source_text: str, variants: int) -> str:
+    if variants == 1:
+        return (
+            "你是專業翻譯引擎。只輸出翻譯結果本身；不要選項、不要解釋、"
+            "不要標題、不要換行、不要 Markdown。\n"
+            f"目標語言：Indonesian\n原文：{source_text}"
+        )
+    return (
+        "你是專業翻譯引擎。請提供三種自然的印尼文說法。"
+        "只輸出三行結果，每行一句，不要標題、不要編號、不要項目符號、不要解釋。\n"
+        f"目標語言：Indonesian\n原文：{source_text}"
+    )
+
+
+def _first_n_lines(text: str, n: int) -> list[str]:
+    lines = [ln.strip() for ln in text.replace("\r", "").split("\n") if ln.strip()]
+    return lines[:n]
+
+
 def gemini_reply(user_text: str) -> str:
     full_prompt = SYSTEM_PROMPT + "\n\nUser message:\n" + user_text
     text = call_gemini(full_prompt)
@@ -508,7 +551,6 @@ async def line_webhook(
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text_message(event: MessageEvent):
     user_text = (event.message.text or "").strip()
-    is_translation = "翻譯" in user_text
 
     source = event.source
     chat_type = getattr(source, "type", "unknown")  # user / group / room
@@ -516,7 +558,28 @@ def handle_text_message(event: MessageEvent):
     # 1) 本機記錄（可留可不留）
     log_line_message_local(event, user_text)
 
-    # 2) 先寫入 GitHub journal（使用者訊息，包含來源）
+    # 2) 記錄模式：只記錄、不進 Gemini
+    if _is_keep_mode(user_text):
+        reply_text = "已記"
+        try:
+            messaging_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text)],
+                )
+            )
+        except Exception as e:
+            print(f"Reply failed: {type(e).__name__}: {e}")
+
+        try:
+            append_to_daily_journal([
+                f"- [{now_hm()}] ({chat_type}) Sonya: {user_text}",
+            ])
+        except Exception as e:
+            print(f"append user to journal failed: {type(e).__name__}: {e}")
+        return
+
+    # 3) 先寫入 GitHub journal（使用者訊息，包含來源）
     try:
         append_to_daily_journal([
             f"- [{now_hm()}] ({chat_type}) Sonya: {user_text}",
@@ -524,7 +587,7 @@ def handle_text_message(event: MessageEvent):
     except Exception as e:
         print(f"append user to journal failed: {type(e).__name__}: {e}")
 
-    # 3) 回覆策略：群組/聊天室只有觸發才回
+    # 4) 回覆策略：群組/聊天室只有觸發才回
     should_reply = True
     if chat_type in ("group", "room"):
         should_reply = any(t in user_text for t in TRIGGERS)
@@ -532,7 +595,7 @@ def handle_text_message(event: MessageEvent):
     if not should_reply:
         return
 
-    # 4) help 指令
+    # 5) help 指令
     if user_text.lower() in ["/help", "help"]:
         reply_text = (
             "宋家萬事興已啟動。\n"
@@ -551,12 +614,41 @@ def handle_text_message(event: MessageEvent):
             for t in TRIGGERS:
                 cleaned = cleaned.replace(t, "").strip()
         prompt = cleaned if cleaned else user_text
-        if is_translation:
-            reply_text = gemini_translate_reply(prompt)
+
+        translation_single = _match_id_translation_single(prompt)
+        translation_three = _match_id_translation_three(prompt)
+        if translation_single is not None:
+            if not translation_single:
+                reply_text = "請提供要翻譯的文字"
+            else:
+                trans_prompt = _build_id_translation_prompt(translation_single, 1)
+                text = call_gemini(
+                    trans_prompt,
+                    system_instruction=INDONESIAN_TRANSLATION_SYSTEM_PROMPT,
+                    generation_config={"temperature": 0.2, "max_output_tokens": 80},
+                )
+                lines = _first_n_lines(text or "", 1)
+                reply_text = lines[0] if lines else AI_BUSY_TRANSLATION_MESSAGE
+        elif translation_three is not None:
+            if not translation_three:
+                reply_text = "請提供要翻譯的文字"
+            else:
+                trans_prompt = _build_id_translation_prompt(translation_three, 3)
+                text = call_gemini(
+                    trans_prompt,
+                    system_instruction=(
+                        "You are a translation engine. Output EXACTLY three lines, "
+                        "each line a different Indonesian translation. "
+                        "No numbering, no bullets, no labels, no extra text."
+                    ),
+                    generation_config={"temperature": 0.4, "max_output_tokens": 120},
+                )
+                lines = _first_n_lines(text or "", 3)
+                reply_text = "\n".join(lines) if len(lines) == 3 else AI_BUSY_TRANSLATION_MESSAGE
         else:
             reply_text = gemini_reply(prompt)
 
-    # 5) 回覆給 LINE
+    # 6) 回覆給 LINE
     try:
         messaging_api.reply_message(
             ReplyMessageRequest(
@@ -567,7 +659,7 @@ def handle_text_message(event: MessageEvent):
     except Exception as e:
         print(f"Reply failed: {type(e).__name__}: {e}")
 
-    # 6) 再把機器人回覆也寫入 GitHub journal
+    # 7) 再把機器人回覆也寫入 GitHub journal
     try:
         append_to_daily_journal([
             f"- [{now_hm()}] Bot: {reply_text}",
