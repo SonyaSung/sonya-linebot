@@ -147,10 +147,10 @@ if missing:
 app = FastAPI()
 
 # Print identity at startup (shows in Railway deploy logs)
-print(f"[{APP_NAME}] booting...")
-print(f"[{APP_NAME}] file={APP_FILE}")
-print(f"[{APP_NAME}] build={APP_BUILD} env={APP_ENV}")
-print(f"[{APP_NAME}] journal_branch={JOURNAL_BRANCH}")
+print(f"[{APP_NAME}] booting...", flush=True)
+print(f"[{APP_NAME}] file={APP_FILE}", flush=True)
+print(f"[{APP_NAME}] build={APP_BUILD} env={APP_ENV}", flush=True)
+print(f"[{APP_NAME}] journal_branch={JOURNAL_BRANCH}", flush=True)
 
 # Minimal request logging for Railway HTTP logs
 @app.middleware("http")
@@ -159,7 +159,8 @@ async def log_requests(request: Request, call_next):
     response = await call_next(request)
     dur_ms = int((datetime.now(timezone.utc) - start_ts).total_seconds() * 1000)
     print(
-        f'HTTP {request.method} {request.url.path} -> {response.status_code} {dur_ms}ms'
+        f'HTTP {request.method} {request.url.path} -> {response.status_code} {dur_ms}ms',
+        flush=True
     )
     return response
 
@@ -513,7 +514,8 @@ def handle_text_message(event: MessageEvent):
 
     if not to_id:
         print(
-            f"enqueue skipped: missing to_id chat_type={chat_type} msg_len={len(user_text)}"
+            f"enqueue skipped: missing to_id chat_type={chat_type} msg_len={len(user_text)}",
+            flush=True
         )
         return
 
@@ -533,12 +535,14 @@ def handle_text_message(event: MessageEvent):
         )
         print(
             f"enqueue ok job_id={job.id} chat_type={chat_type} "
-            f"msg_len={len(payload['user_text'])} ts={payload['timestamp']}"
+            f"msg_len={len(payload['user_text'])} ts={payload['timestamp']}",
+            flush=True
         )
     except Exception as e:
         print(
             f"enqueue failed chat_type={chat_type} msg_len={len(payload['user_text'])}: "
-            f"{type(e).__name__}: {e}"
+            f"{type(e).__name__}: {e}",
+            flush=True
         )
         raise
 
@@ -551,5 +555,5 @@ def handle_text_message(event: MessageEvent):
             )
         )
     except Exception as e:
-        print(f"ACK reply failed: {type(e).__name__}: {e}")
+        print(f"ACK reply failed: {type(e).__name__}: {e}", flush=True)
 

@@ -71,8 +71,8 @@ def _build_reply_text(prompt: str) -> tuple[str, bool]:
 
 
 def process_line_job(payload: dict):
-    print("WORKER RECEIVED JOB:", payload)
-    print("WORKER GOT JOB", payload.keys())
+    print("WORKER RECEIVED JOB:", payload, flush=True)
+    print("WORKER GOT JOB", payload.keys(), flush=True)
     chat_type = payload.get("chat_type", "unknown")
     to_id = payload.get("to_id")
     user_text = (payload.get("user_text") or "").strip()
@@ -84,7 +84,8 @@ def process_line_job(payload: dict):
         raise ValueError("payload missing user_text")
 
     print(
-        f"job start chat_type={chat_type} to_id={to_id} msg_len={len(user_text)} ts={ts}"
+        f"job start chat_type={chat_type} to_id={to_id} msg_len={len(user_text)} ts={ts}",
+        flush=True
     )
 
     try:
@@ -108,9 +109,9 @@ def process_line_job(payload: dict):
                 messages=[TextMessage(text=reply_text)],
             )
         )
-        print(f"push success to={to_id} reply_len={len(reply_text)}")
+        print(f"push success to={to_id} reply_len={len(reply_text)}", flush=True)
     except Exception as e:
-        print(f"push failed to={to_id}: {type(e).__name__}: {e}")
+        print(f"push failed to={to_id}: {type(e).__name__}: {e}", flush=True)
         raise
 
     try:
@@ -120,7 +121,7 @@ def process_line_job(payload: dict):
         print(f"journal write bot: failed {type(e).__name__}: {e}")
         raise
 
-    print(f"job end chat_type={chat_type} to_id={to_id}")
+    print(f"job end chat_type={chat_type} to_id={to_id}", flush=True)
 
 
 if __name__ == "__main__":
@@ -134,7 +135,7 @@ if __name__ == "__main__":
 
     queue = Queue(QUEUE_NAME, connection=redis_conn)
 
-    print(f"Worker starting: queue={QUEUE_NAME} redis={redis_url}")
+    print(f"Worker starting: queue={QUEUE_NAME} redis={redis_url}", flush=True)
 
     worker = Worker([queue], connection=redis_conn)
     worker.work()
