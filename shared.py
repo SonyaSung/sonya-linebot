@@ -13,6 +13,10 @@ from urllib.error import HTTPError, URLError
 from dotenv import load_dotenv
 from google import genai
 from google.genai import errors as genai_errors
+import concurrent.futures
+import requests
+import hmac
+import hashlib
 from linebot.v3.messaging import ApiClient, Configuration, MessagingApi
 
 if os.path.exists(".env"):
@@ -222,16 +226,30 @@ def call_gemini(
     backoffs = [0.8, 1.6, 3.2, 6.4]
     last_error: Exception | None = None
 
+    # Run requests to GenAI with a per-call timeout using thread executor
+    per_call_timeout = 10
     for model in models:
         for delay in backoffs:
             try:
-                resp = genai_client.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    generation_config=generation_config,
-                    system_instruction=system_instruction,
-                )
+                def _call():
+                    return genai_client.models.generate_content(
+                        model=model,
+                        contents=prompt,
+                        generation_config=generation_config,
+                        system_instruction=system_instruction,
+                    )
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                    fut = ex.submit(_call)
+                    resp = fut.result(timeout=per_call_timeout)
+
                 return (resp.text or "").strip()
+            except concurrent.futures.TimeoutError as e:
+                last_error = e
+                # treat as retryable
+                jitter = random.uniform(0.0, 0.2)
+                time.sleep(delay + jitter)
+                continue
             except Exception as e:
                 last_error = e
                 if not _is_retryable_error(e):
@@ -243,6 +261,28 @@ def call_gemini(
     if last_error:
         print(f"Gemini call failed: {type(last_error).__name__}: {last_error}")
     return None
+
+
+def _line_headers():
+    return {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+
+def line_reply_request(reply_token: str, messages: list[str], timeout=(3, 5)):
+    url = "https://api.line.me/v2/bot/message/reply"
+    body = {
+        "replyToken": reply_token,
+        "messages": [{"type": "text", "text": t} for t in messages],
+    }
+    return requests.post(url, json=body, headers=_line_headers(), timeout=timeout)
+
+
+def line_push_request(to: str, messages: list[str], timeout=(3, 10)):
+    url = "https://api.line.me/v2/bot/message/push"
+    body = {"to": to, "messages": [{"type": "text", "text": t} for t in messages]}
+    return requests.post(url, json=body, headers=_line_headers(), timeout=timeout)
 
 
 def _is_keep_mode(text: str) -> bool:

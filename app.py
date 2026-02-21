@@ -5,6 +5,8 @@ import base64
 import time
 import re
 import random
+import hmac
+import hashlib
 import uuid
 from urllib.parse import quote
 from pathlib import Path
@@ -12,7 +14,7 @@ from datetime import datetime, timezone, timedelta
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
 
-from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi import FastAPI, Request, Header, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 
 # Only load .env locally. On Railway, use Variables.
@@ -152,6 +154,7 @@ print(f"[{APP_NAME}] booting...", flush=True)
 print(f"[{APP_NAME}] file={APP_FILE}", flush=True)
 print(f"[{APP_NAME}] build={APP_BUILD} env={APP_ENV}", flush=True)
 print(f"[{APP_NAME}] journal_branch={JOURNAL_BRANCH}", flush=True)
+print(f"[sonya-linebot] redis={'SET' if REDIS_URL else 'UNSET'} queue={os.getenv('RQ_QUEUE','line')} build={APP_BUILD}", flush=True)
 
 # Minimal request logging for Railway HTTP logs
 @app.middleware("http")
@@ -482,6 +485,7 @@ def routes():
 async def line_webhook(
     request: Request,
     x_line_signature: str | None = Header(default=None, alias="X-Line-Signature"),
+    background_tasks: BackgroundTasks = None,
 ):
     if not x_line_signature:
         raise HTTPException(status_code=400, detail="Missing X-Line-Signature header")
@@ -489,14 +493,83 @@ async def line_webhook(
     body = await request.body()
     body_text = body.decode("utf-8")
 
+    # Verify signature (HMAC-SHA256, base64)
     try:
-        handler.handle(body_text, x_line_signature)
-    except InvalidSignatureError:
-        return JSONResponse(status_code=400, content={"ok": False, "error": "invalid signature"})
+        sig = base64.b64encode(hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256).digest()).decode()
+        if not hmac.compare_digest(sig, x_line_signature):
+            return JSONResponse(status_code=400, content={"ok": False, "error": "invalid signature"})
     except Exception as e:
         return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
+    # Parse events and enqueue in background to ensure fast HTTP 200 response
+    try:
+        data = json.loads(body_text)
+        events = data.get("events", [])
+    except Exception:
+        events = []
+
+    for ev in events:
+        trace_id = uuid.uuid4().hex
+        event_type = ev.get("type")
+        user = ev.get("source", {}).get("userId") or ev.get("source", {}).get("user_id")
+        print(f"[line-webhook] RECEIVED trace_id={trace_id} event_type={event_type} user={user}", flush=True)
+        if background_tasks is not None:
+            background_tasks.add_task(_process_event_in_background, ev, trace_id)
+
     return {"ok": True}
+
+
+def _process_event_in_background(ev: dict, trace_id: str):
+    # Build payload from raw event dict (only minimal fields)
+    try:
+        src = ev.get("source", {})
+        chat_type = src.get("type", "unknown")
+        to_id = src.get("userId") or src.get("user_id") or src.get("groupId") or src.get("roomId") or None
+        user_text = ""
+        if ev.get("message"):
+            user_text = ev["message"].get("text", "")
+
+        payload = {
+            "chat_type": chat_type,
+            "to_id": to_id,
+            "user_text": user_text,
+            "timestamp": ev.get("timestamp", int(time.time() * 1000)),
+            "source_user_id": src.get("userId") or src.get("user_id"),
+            "trace_id": trace_id,
+        }
+
+        redis_display = _mask_redis_url(REDIS_URL)
+        try:
+            redis_conn.ping()
+        except Exception as e:
+            print(f"[line-webhook] ENQUEUE_FAIL trace_id={trace_id} reason=redis_unreachable err={type(e).__name__}:{e} redis={redis_display} queue={RQ_QUEUE}", flush=True)
+            return
+
+        job = line_queue.enqueue(
+            "worker.process_line_job",
+            payload,
+            job_timeout=120,
+            result_ttl=0,
+            failure_ttl=3600,
+        )
+        print(f"[line-webhook] ENQUEUE_OK trace_id={trace_id} job_id={getattr(job, 'id', None)}", flush=True)
+
+        # optional fast ACK reply (non-blocking to HTTP response because we're in background)
+        try:
+            reply_token = ev.get("replyToken")
+            if reply_token:
+                from shared import line_reply_request
+                try:
+                    resp = line_reply_request(reply_token, ["收到，處理中"], timeout=(3, 5))
+                    if not (200 <= getattr(resp, 'status_code', 0) < 300):
+                        print(f"[line-webhook] ACK_FAIL trace_id={trace_id} status={getattr(resp, 'status_code', None)}", flush=True)
+                except Exception as e:
+                    print(f"[line-webhook] ACK_FAIL trace_id={trace_id} err={type(e).__name__}:{e}", flush=True)
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"[line-webhook] ENQUEUE_FAIL trace_id={trace_id} err={type(e).__name__}:{e}", flush=True)
 
 
 # =====================================================
