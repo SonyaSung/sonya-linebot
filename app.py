@@ -8,6 +8,7 @@ import random
 import hmac
 import hashlib
 import uuid
+import logging
 from urllib.parse import quote
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -142,6 +143,12 @@ if not _present(REDIS_URL):
     missing.append("REDIS_URL (or RAILWAY_REDIS_URL)")
 if missing:
     raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
+
+
+# =====================================================
+# Logging
+# =====================================================
+logger = logging.getLogger("uvicorn.error")
 
 
 # =====================================================
@@ -356,7 +363,6 @@ def _is_retryable_error(err: Exception) -> bool:
 def call_gemini(
     prompt: str,
     system_instruction: str | None = None,
-    generation_config: dict | None = None,
 ) -> str | None:
     models = [GEMINI_MODEL, GEMINI_FALLBACK_MODEL_1, GEMINI_FALLBACK_MODEL_2]
     models = [m for m in models if m]
@@ -370,7 +376,6 @@ def call_gemini(
                 resp = genai_client.models.generate_content(
                     model=model,
                     contents=prompt,
-                    generation_config=generation_config,
                     system_instruction=system_instruction,
                 )
                 return (resp.text or "").strip()
@@ -435,10 +440,6 @@ def gemini_translate_reply(user_text: str) -> str:
     text = call_gemini(
         user_text,
         system_instruction=TRANSLATION_CONCISE_SYSTEM_PROMPT,
-        generation_config={
-            "temperature": 0.2,
-            "max_output_tokens": 80,
-        },
     )
     if text:
         return text
@@ -489,7 +490,7 @@ async def line_webhook(
 ):
     # Generate trace_id at the very first line for end-to-end instrumentation
     trace_id = uuid.uuid4().hex[:12]
-    print(f"RECEIVED trace_id={trace_id} path=/line/webhook", flush=True)
+    logger.info("RECEIVED trace_id=%s path=/line/webhook", trace_id)
 
     if not x_line_signature:
         raise HTTPException(status_code=400, detail="Missing X-Line-Signature header")
@@ -512,14 +513,14 @@ async def line_webhook(
     except Exception:
         events = []
 
-    print(f"events_count={len(events)}", flush=True)
+    logger.info("events_count=%d", len(events))
 
     for ev in events:
         event_type = ev.get("type")
         msg_type = None
         if ev.get("message"):
             msg_type = ev["message"].get("type")
-        print(f"event_type={event_type} message_type={msg_type}", flush=True)
+        logger.info("event_type=%s message_type=%s", event_type, msg_type)
         if background_tasks is not None:
             background_tasks.add_task(_process_event_in_background, ev, trace_id)
 
@@ -560,7 +561,7 @@ def _process_event_in_background(ev: dict, trace_id: str):
             failure_ttl=3600,
         )
         queue_name = RQ_QUEUE or "line"
-        print(f"ENQUEUE_OK trace_id={trace_id} queue={queue_name} job_id={getattr(job, 'id', None)}", flush=True)
+        logger.info("ENQUEUE_OK trace_id=%s queue=%s job_id=%s", trace_id, queue_name, job.id)
 
         # optional fast ACK reply (non-blocking to HTTP response because we're in background)
         try:
@@ -576,8 +577,8 @@ def _process_event_in_background(ev: dict, trace_id: str):
         except Exception:
             pass
 
-    except Exception as e:
-        print(f"ENQUEUE_FAIL trace_id={trace_id} err={type(e).__name__}:{e}", flush=True)
+    except Exception:
+        logger.exception("ENQUEUE_FAIL trace_id=%s", trace_id)
 
 
 # =====================================================

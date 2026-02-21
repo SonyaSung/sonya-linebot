@@ -218,7 +218,6 @@ def _is_retryable_error(err: Exception) -> bool:
 def call_gemini(
     prompt: str,
     system_instruction: str | None = None,
-    generation_config: dict | None = None,
 ) -> str | None:
     models = [GEMINI_MODEL, GEMINI_FALLBACK_MODEL_1, GEMINI_FALLBACK_MODEL_2]
     models = [m for m in models if m]
@@ -235,7 +234,6 @@ def call_gemini(
                     return genai_client.models.generate_content(
                         model=model,
                         contents=prompt,
-                        generation_config=generation_config,
                         system_instruction=system_instruction,
                     )
 

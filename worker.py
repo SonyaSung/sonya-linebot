@@ -46,7 +46,6 @@ def _build_reply_text(prompt: str) -> tuple[str, bool]:
         text = call_gemini(
             trans_prompt,
             system_instruction=INDONESIAN_TRANSLATION_SYSTEM_PROMPT,
-            generation_config={"temperature": 0.2, "max_output_tokens": 80},
         )
         lines = _first_n_lines(text or "", 1)
         return (lines[0] if lines else AI_BUSY_TRANSLATION_MESSAGE), True
@@ -62,7 +61,6 @@ def _build_reply_text(prompt: str) -> tuple[str, bool]:
                 "each line a different Indonesian translation. "
                 "No numbering, no bullets, no labels, no extra text."
             ),
-            generation_config={"temperature": 0.4, "max_output_tokens": 120},
         )
         lines = _first_n_lines(text or "", 3)
         if len(lines) == 3:
