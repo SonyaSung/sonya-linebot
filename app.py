@@ -487,6 +487,10 @@ async def line_webhook(
     x_line_signature: str | None = Header(default=None, alias="X-Line-Signature"),
     background_tasks: BackgroundTasks = None,
 ):
+    # Generate trace_id at the very first line for end-to-end instrumentation
+    trace_id = uuid.uuid4().hex[:12]
+    print(f"RECEIVED trace_id={trace_id} path=/line/webhook", flush=True)
+
     if not x_line_signature:
         raise HTTPException(status_code=400, detail="Missing X-Line-Signature header")
 
@@ -508,11 +512,14 @@ async def line_webhook(
     except Exception:
         events = []
 
+    print(f"events_count={len(events)}", flush=True)
+
     for ev in events:
-        trace_id = uuid.uuid4().hex
         event_type = ev.get("type")
-        user = ev.get("source", {}).get("userId") or ev.get("source", {}).get("user_id")
-        print(f"[line-webhook] RECEIVED trace_id={trace_id} event_type={event_type} user={user}", flush=True)
+        msg_type = None
+        if ev.get("message"):
+            msg_type = ev["message"].get("type")
+        print(f"event_type={event_type} message_type={msg_type}", flush=True)
         if background_tasks is not None:
             background_tasks.add_task(_process_event_in_background, ev, trace_id)
 
@@ -552,7 +559,8 @@ def _process_event_in_background(ev: dict, trace_id: str):
             result_ttl=0,
             failure_ttl=3600,
         )
-        print(f"[line-webhook] ENQUEUE_OK trace_id={trace_id} job_id={getattr(job, 'id', None)}", flush=True)
+        queue_name = RQ_QUEUE or "line"
+        print(f"ENQUEUE_OK trace_id={trace_id} queue={queue_name} job_id={getattr(job, 'id', None)}", flush=True)
 
         # optional fast ACK reply (non-blocking to HTTP response because we're in background)
         try:
@@ -569,7 +577,7 @@ def _process_event_in_background(ev: dict, trace_id: str):
             pass
 
     except Exception as e:
-        print(f"[line-webhook] ENQUEUE_FAIL trace_id={trace_id} err={type(e).__name__}:{e}", flush=True)
+        print(f"ENQUEUE_FAIL trace_id={trace_id} err={type(e).__name__}:{e}", flush=True)
 
 
 # =====================================================

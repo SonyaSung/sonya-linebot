@@ -78,10 +78,7 @@ def process_line_job(payload: dict):
     trace_id = payload.get("trace_id")
     start_ts = time.time()
 
-    print(
-        f"[grand-healing] WORKER_RECEIVED trace_id={trace_id} job_id={job_id} payload_keys={list(payload.keys())}",
-        flush=True,
-    )
+    print(f"WORKER_RECEIVED trace_id={trace_id}", flush=True)
 
     try:
         chat_type = payload.get("chat_type", "unknown")
@@ -97,16 +94,16 @@ def process_line_job(payload: dict):
         append_to_daily_journal([f"- [{now_hm()}] ({chat_type}) Sonya: {user_text}"])
 
         reply_text, used_gemini = _build_reply_text(user_text)
-        print(f"[grand-healing] GEMINI_DONE trace_id={trace_id}", flush=True)
+        print(f"GEMINI_DONE trace_id={trace_id}", flush=True)
 
         # Use direct HTTP push with timeout to ensure timeouts are enforced
         try:
             resp = line_push_request(to_id, [reply_text], timeout=(3, 10))
             if not (200 <= getattr(resp, 'status_code', 0) < 300):
                 raise RuntimeError(f"push failed status={getattr(resp,'status_code',None)} body={getattr(resp,'text',None)}")
-            print(f"[grand-healing] PUSH_DONE trace_id={trace_id}", flush=True)
+            print(f"PUSH_DONE trace_id={trace_id}", flush=True)
         except Exception as e:
-            print(f"[grand-healing] PUSH_DONE trace_id={trace_id} err={type(e).__name__}:{e}", flush=True)
+            print(f"PUSH_FAIL trace_id={trace_id} err={type(e).__name__}:{e}", flush=True)
             raise
 
         append_to_daily_journal([f"- [{now_hm()}] Bot: {reply_text}", ""])
@@ -118,11 +115,7 @@ def process_line_job(payload: dict):
         )
 
     except Exception as e:
-        tb = traceback.format_exc()
-        print(
-            f"[grand-healing] JOB_FAIL trace_id={trace_id} err={type(e).__name__}:{e} \n{tb}",
-            flush=True,
-        )
+        print(f"JOB_FAIL trace_id={trace_id} err={type(e).__name__}:{e}", flush=True)
         # Re-raise so RQ can record failure / retry if configured
         raise
 
@@ -146,7 +139,7 @@ if __name__ == "__main__":
 
     queue = Queue(QUEUE_NAME, connection=redis_conn)
 
-    print(f"Worker starting: queue={QUEUE_NAME} redis={_mask_redis(redis_url)}", flush=True)
+    print(f"WORKER_BOOT queue={QUEUE_NAME} redis={_mask_redis(redis_url)}", flush=True)
 
     worker = Worker([queue], connection=redis_conn)
     worker.work()
