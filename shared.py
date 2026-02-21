@@ -12,8 +12,6 @@ from urllib.error import HTTPError, URLError
 
 from dotenv import load_dotenv
 from google import genai
-from google.genai import errors as genai_errors
-import concurrent.futures
 import requests
 import hmac
 import hashlib
@@ -207,58 +205,23 @@ def append_to_daily_journal(lines_to_append: list[str]):
     gh_put_file(path_in_repo, new_text, message=f"daily: {ymd}", sha=sha)
 
 
-def _is_retryable_error(err: Exception) -> bool:
-    if isinstance(err, TimeoutError):
-        return True
-    if isinstance(err, genai_errors.APIError):
-        return err.code in (429, 503)
-    return False
+def call_gemini(prompt: str, system_instruction: str | None = None) -> str | None:
+    contents = prompt
 
+    if system_instruction:
+        contents = system_instruction + "\n\n" + prompt
 
-def call_gemini(
-    prompt: str,
-    system_instruction: str | None = None,
-) -> str | None:
-    models = [GEMINI_MODEL, GEMINI_FALLBACK_MODEL_1, GEMINI_FALLBACK_MODEL_2]
-    models = [m for m in models if m]
+    try:
+        resp = genai_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=contents
+        )
 
-    backoffs = [0.8, 1.6, 3.2, 6.4]
-    last_error: Exception | None = None
+        return resp.text
 
-    # Run requests to GenAI with a per-call timeout using thread executor
-    per_call_timeout = 10
-    for model in models:
-        for delay in backoffs:
-            try:
-                def _call():
-                    return genai_client.models.generate_content(
-                        model=model,
-                        contents=prompt,
-                        system_instruction=system_instruction,
-                    )
-
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                    fut = ex.submit(_call)
-                    resp = fut.result(timeout=per_call_timeout)
-
-                return (resp.text or "").strip()
-            except concurrent.futures.TimeoutError as e:
-                last_error = e
-                # treat as retryable
-                jitter = random.uniform(0.0, 0.2)
-                time.sleep(delay + jitter)
-                continue
-            except Exception as e:
-                last_error = e
-                if not _is_retryable_error(e):
-                    break
-                jitter = random.uniform(0.0, 0.2)
-                time.sleep(delay + jitter)
-        continue
-
-    if last_error:
-        print(f"Gemini call failed: {type(last_error).__name__}: {last_error}")
-    return None
+    except Exception as e:
+        print(f"GEMINI_FAIL {type(e).__name__}:{e}", flush=True)
+        return "AI busy, please try again."
 
 
 def _line_headers():
