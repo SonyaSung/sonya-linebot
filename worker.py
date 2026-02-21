@@ -1,7 +1,9 @@
 import os
+import time
+import traceback
 
 from redis import Redis
-from rq import Queue, Worker
+from rq import Queue, Worker, get_current_job
 
 from linebot.v3.messaging import PushMessageRequest, TextMessage
 
@@ -71,57 +73,54 @@ def _build_reply_text(prompt: str) -> tuple[str, bool]:
 
 
 def process_line_job(payload: dict):
-    print("WORKER RECEIVED JOB:", payload, flush=True)
-    print("WORKER GOT JOB", payload.keys(), flush=True)
-    chat_type = payload.get("chat_type", "unknown")
-    to_id = payload.get("to_id")
-    user_text = (payload.get("user_text") or "").strip()
-    ts = payload.get("timestamp")
-
-    if not to_id:
-        raise ValueError("payload missing to_id")
-    if not user_text:
-        raise ValueError("payload missing user_text")
+    job = get_current_job()
+    job_id = job.id if job else None
+    trace_id = payload.get("trace_id")
+    start_ts = time.time()
 
     print(
-        f"job start chat_type={chat_type} to_id={to_id} msg_len={len(user_text)} ts={ts}",
-        flush=True
+        f"[grand-healing] WORKER_RECEIVED trace_id={trace_id} job_id={job_id} payload_keys={list(payload.keys())}",
+        flush=True,
     )
 
     try:
+        chat_type = payload.get("chat_type", "unknown")
+        to_id = payload.get("to_id")
+        user_text = (payload.get("user_text") or "").strip()
+        ts = payload.get("timestamp")
+
+        if not to_id:
+            raise ValueError("payload missing to_id")
+        if not user_text:
+            raise ValueError("payload missing user_text")
+
         append_to_daily_journal([f"- [{now_hm()}] ({chat_type}) Sonya: {user_text}"])
-        print("journal write user: success")
-    except Exception as e:
-        print(f"journal write user: failed {type(e).__name__}: {e}")
-        raise
 
-    try:
         reply_text, used_gemini = _build_reply_text(user_text)
-        print(f"gemini step: {'success' if used_gemini else 'skipped'}")
-    except Exception as e:
-        print(f"gemini step: failed {type(e).__name__}: {e}")
-        raise
 
-    try:
         messaging_api.push_message(
             PushMessageRequest(
                 to=to_id,
                 messages=[TextMessage(text=reply_text)],
             )
         )
-        print(f"push success to={to_id} reply_len={len(reply_text)}", flush=True)
-    except Exception as e:
-        print(f"push failed to={to_id}: {type(e).__name__}: {e}", flush=True)
-        raise
 
-    try:
         append_to_daily_journal([f"- [{now_hm()}] Bot: {reply_text}", ""])
-        print("journal write bot: success")
-    except Exception as e:
-        print(f"journal write bot: failed {type(e).__name__}: {e}")
-        raise
 
-    print(f"job end chat_type={chat_type} to_id={to_id}", flush=True)
+        elapsed_ms = int((time.time() - start_ts) * 1000)
+        print(
+            f"[grand-healing] JOB_DONE trace_id={trace_id} elapsed_ms={elapsed_ms}",
+            flush=True,
+        )
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(
+            f"[grand-healing] JOB_FAIL trace_id={trace_id} err={type(e).__name__}:{e} \n{tb}",
+            flush=True,
+        )
+        # Re-raise so RQ can record failure / retry if configured
+        raise
 
 
 if __name__ == "__main__":
@@ -131,11 +130,19 @@ if __name__ == "__main__":
         or "redis://localhost:6379/0"
     )
 
+    def _mask_redis(url: str | None) -> str:
+        if not url:
+            return ""
+        try:
+            return __import__("re").sub(r"://.*@", "://***@", url)
+        except Exception:
+            return url
+
     redis_conn = Redis.from_url(redis_url)
 
     queue = Queue(QUEUE_NAME, connection=redis_conn)
 
-    print(f"Worker starting: queue={QUEUE_NAME} redis={redis_url}", flush=True)
+    print(f"[grand-healing] BOOT queue={QUEUE_NAME} redis={_mask_redis(redis_url)}", flush=True)
 
     worker = Worker([queue], connection=redis_conn)
     worker.work()

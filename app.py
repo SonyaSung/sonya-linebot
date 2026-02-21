@@ -5,6 +5,7 @@ import base64
 import time
 import re
 import random
+import uuid
 from urllib.parse import quote
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -172,7 +173,20 @@ messaging_api = MessagingApi(line_api_client)
 
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
 redis_conn = Redis.from_url(REDIS_URL)
-line_queue = Queue("line", connection=redis_conn)
+
+# Respect RQ queue name from env so app and worker match
+RQ_QUEUE = os.getenv("RQ_QUEUE", "line")
+line_queue = Queue(RQ_QUEUE, connection=redis_conn)
+
+
+def _mask_redis_url(url: str | None) -> str:
+    if not url:
+        return ""
+    try:
+        # Mask credentials (everything between :// and @)
+        return __import__("re").sub(r"://.*@", "://***@", url)
+    except Exception:
+        return url
 
 
 # =====================================================
@@ -526,25 +540,69 @@ def handle_text_message(event: MessageEvent):
         "timestamp": getattr(event, "timestamp", int(time.time() * 1000)),
         "source_user_id": getattr(source, "user_id", None),
     }
+    # build trace_id preference order: message.id -> replyToken[:8]+timestamp -> uuid4[:12]
+    trace_id = None
+    try:
+        trace_id = getattr(event.message, "id", None)
+    except Exception:
+        trace_id = None
+
+    if not trace_id:
+        reply_token = getattr(event, "reply_token", "") or ""
+        ts_short = str(payload.get("timestamp", int(time.time() * 1000)))
+        if reply_token:
+            trace_id = (reply_token[:8] + ts_short)[:12]
+        else:
+            trace_id = uuid.uuid4().hex[:12]
+
+    payload["trace_id"] = trace_id
+
+    # Minimal redis reachability check
+    redis_display = _mask_redis_url(REDIS_URL)
+
+    print(
+        f"[line-webhook] RECEIVED trace_id={trace_id} user_id={payload.get('source_user_id')} "
+        f"msg_type={payload.get('chat_type')} text_len={len(payload.get('user_text') or '')}",
+        flush=True,
+    )
 
     try:
+        try:
+            # quick ping to surface redis connectivity issues
+            redis_conn.ping()
+        except Exception as e:
+            print(
+                f"[line-webhook] ENQUEUE_FAIL trace_id={trace_id} reason=redis_unreachable "
+                f"err={type(e).__name__}:{e} redis={redis_display} queue={RQ_QUEUE}",
+                flush=True,
+            )
+            return
+
         job = line_queue.enqueue(
             "worker.process_line_job",
             payload,
             retry=Retry(max=3, interval=[10, 30, 60]),
+            job_id=f"line:{trace_id}",
+            job_timeout=180,
+            result_ttl=0,
+            ttl=600,
+            failure_ttl=86400,
         )
+
         print(
-            f"enqueue ok job_id={job.id} chat_type={chat_type} "
-            f"msg_len={len(payload['user_text'])} ts={payload['timestamp']}",
-            flush=True
+            f"[line-webhook] ENQUEUE_OK trace_id={trace_id} job_id={job.id} "
+            f"queue={RQ_QUEUE} redis={redis_display}",
+            flush=True,
         )
+
     except Exception as e:
         print(
-            f"enqueue failed chat_type={chat_type} msg_len={len(payload['user_text'])}: "
-            f"{type(e).__name__}: {e}",
-            flush=True
+            f"[line-webhook] ENQUEUE_FAIL trace_id={trace_id} err={type(e).__name__}:{e} "
+            f"redis={redis_display} queue={RQ_QUEUE}",
+            flush=True,
         )
-        raise
+        # swallow enqueue errors so webhook returns 200 fast
+        return
 
     # Optional fast ACK so user gets immediate confirmation.
     try:
