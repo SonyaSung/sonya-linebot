@@ -1,9 +1,11 @@
-# app.py
+﻿# app.py
 import os
 import json
 import base64
 import time
 import re
+import random
+from urllib.parse import quote
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from urllib import request as urlrequest
@@ -19,6 +21,7 @@ if os.path.exists(".env"):
 
 # LINE SDK v3
 from linebot.v3 import WebhookHandler
+from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
     ApiClient,
     Configuration,
@@ -31,6 +34,9 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent
 # Google Gen AI SDK
 from google import genai
 from google.genai import errors as genai_errors
+from redis import Redis
+from rq import Queue, Retry
+from shared import TRANSLATION_CONCISE_SYSTEM_PROMPT
 
 
 SYSTEM_PROMPT = """
@@ -51,7 +57,7 @@ Translation rules:
 
 Answer rules:
 - Provide direct answer first.
-- Maximum 1–2 sentences total.
+- Maximum 1?? sentences total.
 
 Journal rules:
 - Write naturally as Sonya's assistant.
@@ -61,87 +67,13 @@ Your personality:
 calm, precise, intelligent, minimal.
 """
 
-TRANSLATION_CONCISE_SYSTEM_PROMPT = """
-你是一個純翻譯引擎，不是老師、解說者或語言顧問。
-
-當使用者要求翻譯時，必須嚴格遵守以下規則：
-
-━━━━━━━━━━━━━━━━━━
-【輸出規則（強制）】
-━━━━━━━━━━━━━━━━━━
-
-只輸出最終翻譯結果。
-
-禁止輸出：
-
-- 解釋
-- 條列
-- 編號
-- 多個版本
-- 括號註解
-- 音標
-- Markdown
-- 前言
-- 結語
-- 說明文字
-- 「以下是翻譯」
-- 「翻譯如下」
-
-輸出只能包含：
-
-→ 一行純翻譯文字
-
-不得包含任何其他內容。
-
-━━━━━━━━━━━━━━━━━━
-【性別敬語規則（全語言適用）】
-━━━━━━━━━━━━━━━━━━
-
-若翻譯語言涉及性別敬語（例如泰文、日文、韓文、印尼文等）：
-
-一律使用：
-
-→ 女性說話者版本
-
-禁止：
-
-- 輸出男性版本
-- 同時輸出男女版本
-- 詢問使用者性別
-- 解釋性別差異
-
-除非使用者明確指定男性，否則永遠使用女性版本。
-
-━━━━━━━━━━━━━━━━━━
-【範例】
-
-使用者：
-請翻譯為泰文：今天我吃得很飽，你呢？
-
-正確輸出：
-วันนี้ฉันกินอิ่มมากค่ะ คุณล่ะคะ?
-
-錯誤輸出（禁止）：
-วันนี้ผมกินอิ่มมากครับ...
-วันนี้ฉันกินอิ่มมากค่ะ...
-（男性 / 女性版本）
-
-錯誤輸出（禁止）：
-以下是翻譯：
-วันนี้ฉันกินอิ่มมากค่ะ
-
-━━━━━━━━━━━━━━━━━━
-
-你必須永遠遵守這些規則。
-"""
-
 INDONESIAN_TRANSLATION_SYSTEM_PROMPT = (
     "You are a translation engine. Output ONLY the final Indonesian translation. "
     "No explanations, no options, no labels, no markdown, no extra lines."
 )
 
 # =====================================================
-# 時區設定（台灣）
+# ?????????????????
 # =====================================================
 TZ_TAIPEI = timezone(timedelta(hours=8))
 
@@ -151,7 +83,7 @@ TZ_TAIPEI = timezone(timedelta(hours=8))
 # =====================================================
 APP_NAME = "sonya-linebot"
 APP_FILE = __file__
-# Railway 常見的 git sha env（不保證一定存在，所以用多個 fallback）
+# Railway ??????git sha env????????????????????????????????????????fallback??
 APP_BUILD = (
     os.getenv("RAILWAY_GIT_COMMIT_SHA")
     or os.getenv("GIT_COMMIT_SHA")
@@ -167,15 +99,16 @@ APP_ENV = os.getenv("RAILWAY_ENVIRONMENT", os.getenv("ENV", "unknown"))
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+REDIS_URL = os.getenv("REDIS_URL") or os.getenv("RAILWAY_REDIS_URL")
 
-# GitHub（用 Contents API 寫入 journal，避免 Railway 兩個 service 檔案系統不共享）
+# GitHub?????Contents API ????潸縐????????journal??????皝弄??Railway ????????service ?????????????????????
 GITHUB_REPO = os.getenv("GITHUB_REPO")  # e.g. "SonyaSung/sonya-linebot"
 GITHUB_PAT = os.getenv("GITHUB_PAT")    # fine-grained PAT with contents write
 
-# ⚠️ 建議：journal 另寫到 journal branch，避免 main 觸發 redeploy
-JOURNAL_BRANCH = os.getenv("JOURNAL_BRANCH", "main")  # 建議改成 "journal"
+# ??? ????????????urnal ?????謑黑???journal branch??????皝弄??main ?????redeploy
+JOURNAL_BRANCH = os.getenv("JOURNAL_BRANCH", "main")  # ??????? "journal"
 
-# Railway 建議設 DATA_DIR=/data（本機可用 data）
+# Railway ????????DATA_DIR=/data??????橘??????????data??
 DATA_DIR = os.getenv("DATA_DIR", "data")
 
 # Model
@@ -183,12 +116,12 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_FALLBACK_MODEL_1 = os.getenv("GEMINI_FALLBACK_MODEL_1")
 GEMINI_FALLBACK_MODEL_2 = os.getenv("GEMINI_FALLBACK_MODEL_2")
 
-AI_BUSY_GENERAL_MESSAGE = "（系統忙碌）我現在有點忙，請稍後再試一次。"
-AI_BUSY_TRANSLATION_MESSAGE = "（系統忙碌）請稍後再試。"
+AI_BUSY_GENERAL_MESSAGE = "Now I'm a bit busy, please try again shortly."
+AI_BUSY_TRANSLATION_MESSAGE = "Translation is busy now, please try again shortly."
 AI_BUSY_MESSAGE = AI_BUSY_GENERAL_MESSAGE
 
-# 觸發字：群組/聊天室只在看到這些才回
-TRIGGERS = ["@宋家萬事興", "/bot"]
+# Trigger words for group/room messages.
+TRIGGERS = ["@\u5b8b\u5bb6\u842c\u4e8b\u8208", "/bot"]
 
 
 def _present(v: str | None) -> bool:
@@ -202,6 +135,8 @@ if not _present(LINE_CHANNEL_SECRET):
     missing.append("LINE_CHANNEL_SECRET")
 if not _present(GEMINI_API_KEY):
     missing.append("GEMINI_API_KEY")
+if not _present(REDIS_URL):
+    missing.append("REDIS_URL (or RAILWAY_REDIS_URL)")
 if missing:
     raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
 
@@ -235,6 +170,8 @@ line_api_client = ApiClient(line_config)
 messaging_api = MessagingApi(line_api_client)
 
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
+redis_conn = Redis.from_url(REDIS_URL)
+line_queue = Queue("line", connection=redis_conn)
 
 
 # =====================================================
@@ -253,13 +190,13 @@ def now_hm() -> str:
 
 
 # =====================================================
-# 本機(同一 container)訊息儲存（保留，方便除錯）
-# 注意：Railway 的不同 service 不共享檔案系統，所以不要依賴它做跨 service 傳遞
+# ???(??? container)????????????????????????
+# ???獢??????????????肄ay ?????service ????????????????蝛遴??????????????????????????????? service ???
 # =====================================================
 def log_line_message_local(event: MessageEvent, user_text: str):
     """
     DATA_DIR/messages/YYYY-MM-DD.jsonl
-    每行一個 JSON
+    ???????????????JSON
     """
     try:
         ymd = today_ymd()
@@ -290,7 +227,7 @@ def log_line_message_local(event: MessageEvent, user_text: str):
 
 
 # =====================================================
-# GitHub Contents API：直接把對話 append 到 repo 的 journal/YYYY-MM-DD.md
+# GitHub Contents API????????????????append ??repo ??journal/YYYY-MM-DD.md
 # =====================================================
 def github_enabled() -> bool:
     return _present(GITHUB_REPO) and _present(GITHUB_PAT)
@@ -329,7 +266,8 @@ def gh_get_file(path_in_repo: str) -> tuple[str | None, str | None]:
     """
     returns (text_content_or_none, sha_or_none)
     """
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path_in_repo}"
+    ref = quote(JOURNAL_BRANCH, safe="")
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path_in_repo}?ref={ref}"
     try:
         data = gh_request("GET", url)
         if not data:
@@ -362,7 +300,7 @@ def gh_put_file(path_in_repo: str, text: str, message: str, sha: str | None = No
 
 def append_to_daily_journal(lines_to_append: list[str]):
     """
-    在 repo 的 journal/YYYY-MM-DD.md 追加內容（不存在就建立）
+    ??repo ??journal/YYYY-MM-DD.md ?????????????????????殉狐???????????????雓???
     """
     if not github_enabled():
         print("GitHub not configured; skip journal upload.")
@@ -374,7 +312,7 @@ def append_to_daily_journal(lines_to_append: list[str]):
     existing, sha = gh_get_file(path_in_repo)
 
     if existing is None:
-        base = [f"# {ymd}", "", "## LINE 對話", ""]
+        base = [f"# {ymd}", "", "## LINE Log", ""]
         new_text = "\n".join(base + lines_to_append).rstrip() + "\n"
         gh_put_file(path_in_repo, new_text, message=f"daily: {ymd}")
         return
@@ -387,7 +325,7 @@ def append_to_daily_journal(lines_to_append: list[str]):
 
 
 # =====================================================
-# Gemini 回覆
+# Gemini ???
 # =====================================================
 def _is_retryable_error(err: Exception) -> bool:
     if isinstance(err, TimeoutError):
@@ -434,34 +372,33 @@ def call_gemini(
 
 def _is_keep_mode(text: str) -> bool:
     return (
-        re.match(r"^\s*[#＃](keep|id)\b", text, re.IGNORECASE) is not None
-        or re.match(r"^\s*(記住|紀錄)[：:]", text) is not None
+        re.match(r"^\s*[#\/]?(keep|id)\b", text, re.IGNORECASE) is not None
+        or re.match(r"^\s*(\u6536\u9304|\u8a18\u9304)\b", text) is not None
     )
 
 
 def _match_id_translation_single(text: str) -> str | None:
-    m = re.match(r"^\s*請翻譯為印尼文[：:]\s*(.*)$", text)
+    m = re.match(r"^\s*\u7ffb\u8b6f\u6210\u5370\u5c3c\u6587[:\uff1a]?\s*(.*)$", text)
     return m.group(1).strip() if m else None
 
 
 def _match_id_translation_three(text: str) -> str | None:
-    m = re.match(r"^\s*請給我3種印尼文說法[：:]\s*(.*)$", text)
+    m = re.match(r"^\s*\u7ffb\u8b6f\u6210\u5370\u5c3c\u6587\u4e09\u7a2e\u7248\u672c[:\uff1a]?\s*(.*)$", text)
     return m.group(1).strip() if m else None
 
 
 def _build_id_translation_prompt(source_text: str, variants: int) -> str:
     if variants == 1:
         return (
-            "你是專業翻譯引擎。只輸出翻譯結果本身；不要選項、不要解釋、"
-            "不要標題、不要換行、不要 Markdown。\n"
-            f"目標語言：Indonesian\n原文：{source_text}"
+            "Please translate the following text to Indonesian and output one final sentence only."
+            "\nNo explanation, no labels, no markdown."
+            f"\nSource: {source_text}"
         )
     return (
-        "你是專業翻譯引擎。請提供三種自然的印尼文說法。"
-        "只輸出三行結果，每行一句，不要標題、不要編號、不要項目符號、不要解釋。\n"
-        f"目標語言：Indonesian\n原文：{source_text}"
+        "Please translate the following text to Indonesian in three different versions."
+        "\nOutput exactly three lines only, without numbering or explanation."
+        f"\nSource: {source_text}"
     )
-
 
 def _first_n_lines(text: str, n: int) -> list[str]:
     lines = [ln.strip() for ln in text.replace("\r", "").split("\n") if ln.strip()]
@@ -516,7 +453,7 @@ def whoami():
 
 @app.get("/routes")
 def routes():
-    # 顯示目前 FastAPI 註冊的所有路由（debug 用）
+    # ??????????授? FastAPI ??????????????debug ???
     out = []
     for r in app.router.routes:
         methods = sorted(getattr(r, "methods", []) or [])
@@ -539,8 +476,10 @@ async def line_webhook(
 
     try:
         handler.handle(body_text, x_line_signature)
+    except InvalidSignatureError:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "invalid signature"})
     except Exception as e:
-        return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
     return {"ok": True}
 
@@ -551,119 +490,66 @@ async def line_webhook(
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text_message(event: MessageEvent):
     user_text = (event.message.text or "").strip()
-
     source = event.source
     chat_type = getattr(source, "type", "unknown")  # user / group / room
 
-    # 1) 本機記錄（可留可不留）
-    log_line_message_local(event, user_text)
+    to_id = None
+    if chat_type == "user":
+        to_id = getattr(source, "user_id", None)
+    elif chat_type == "group":
+        to_id = getattr(source, "group_id", None)
+    elif chat_type == "room":
+        to_id = getattr(source, "room_id", None)
 
-    # 2) 記錄模式：只記錄、不進 Gemini
-    if _is_keep_mode(user_text):
-        reply_text = "已記"
-        try:
-            messaging_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text=reply_text)],
-                )
-            )
-        except Exception as e:
-            print(f"Reply failed: {type(e).__name__}: {e}")
-
-        try:
-            append_to_daily_journal([
-                f"- [{now_hm()}] ({chat_type}) Sonya: {user_text}",
-            ])
-        except Exception as e:
-            print(f"append user to journal failed: {type(e).__name__}: {e}")
-        return
-
-    # 3) 先寫入 GitHub journal（使用者訊息，包含來源）
-    try:
-        append_to_daily_journal([
-            f"- [{now_hm()}] ({chat_type}) Sonya: {user_text}",
-        ])
-    except Exception as e:
-        print(f"append user to journal failed: {type(e).__name__}: {e}")
-
-    # 4) 回覆策略：群組/聊天室只有觸發才回
-    should_reply = True
+    should_process = True
+    cleaned = user_text
     if chat_type in ("group", "room"):
-        should_reply = any(t in user_text for t in TRIGGERS)
+        should_process = any(t in user_text for t in TRIGGERS)
+        for t in TRIGGERS:
+            cleaned = cleaned.replace(t, "").strip()
 
-    if not should_reply:
+    if not should_process:
         return
 
-    # 5) help 指令
-    if user_text.lower() in ["/help", "help"]:
-        reply_text = (
-            "宋家萬事興已啟動。\n"
-            "\n"
-            "規則：\n"
-            "• 私訊：每句回覆\n"
-            "• 群組/聊天室：只有叫我（@宋家萬事興 或 /bot）才回\n"
-            "\n"
-            "指令：\n"
-            "• /help 顯示說明\n"
+    if not to_id:
+        print(
+            f"enqueue skipped: missing to_id chat_type={chat_type} msg_len={len(user_text)}"
         )
-    else:
-        # 群組/聊天室：去掉觸發字再送 Gemini
-        cleaned = user_text
-        if chat_type in ("group", "room"):
-            for t in TRIGGERS:
-                cleaned = cleaned.replace(t, "").strip()
-        prompt = cleaned if cleaned else user_text
+        return
 
-        translation_single = _match_id_translation_single(prompt)
-        translation_three = _match_id_translation_three(prompt)
-        if translation_single is not None:
-            if not translation_single:
-                reply_text = "請提供要翻譯的文字"
-            else:
-                trans_prompt = _build_id_translation_prompt(translation_single, 1)
-                text = call_gemini(
-                    trans_prompt,
-                    system_instruction=INDONESIAN_TRANSLATION_SYSTEM_PROMPT,
-                    generation_config={"temperature": 0.2, "max_output_tokens": 80},
-                )
-                lines = _first_n_lines(text or "", 1)
-                reply_text = lines[0] if lines else AI_BUSY_TRANSLATION_MESSAGE
-        elif translation_three is not None:
-            if not translation_three:
-                reply_text = "請提供要翻譯的文字"
-            else:
-                trans_prompt = _build_id_translation_prompt(translation_three, 3)
-                text = call_gemini(
-                    trans_prompt,
-                    system_instruction=(
-                        "You are a translation engine. Output EXACTLY three lines, "
-                        "each line a different Indonesian translation. "
-                        "No numbering, no bullets, no labels, no extra text."
-                    ),
-                    generation_config={"temperature": 0.4, "max_output_tokens": 120},
-                )
-                lines = _first_n_lines(text or "", 3)
-                reply_text = "\n".join(lines) if len(lines) == 3 else AI_BUSY_TRANSLATION_MESSAGE
-        else:
-            reply_text = gemini_reply(prompt)
+    payload = {
+        "chat_type": chat_type,
+        "to_id": to_id,
+        "user_text": cleaned if cleaned else user_text,
+        "timestamp": getattr(event, "timestamp", int(time.time() * 1000)),
+        "source_user_id": getattr(source, "user_id", None),
+    }
 
-    # 6) 回覆給 LINE
+    try:
+        job = line_queue.enqueue(
+            "worker.process_line_job",
+            payload,
+            retry=Retry(max=3, interval=[10, 30, 60]),
+        )
+        print(
+            f"enqueue ok job_id={job.id} chat_type={chat_type} "
+            f"msg_len={len(payload['user_text'])} ts={payload['timestamp']}"
+        )
+    except Exception as e:
+        print(
+            f"enqueue failed chat_type={chat_type} msg_len={len(payload['user_text'])}: "
+            f"{type(e).__name__}: {e}"
+        )
+        raise
+
+    # Optional fast ACK so user gets immediate confirmation.
     try:
         messaging_api.reply_message(
             ReplyMessageRequest(
                 reply_token=event.reply_token,
-                messages=[TextMessage(text=reply_text)],
+                messages=[TextMessage(text="\u6536\u5230\uff0c\u6211\u6574\u7406\u4e00\u4e0b\u3002")],
             )
         )
     except Exception as e:
-        print(f"Reply failed: {type(e).__name__}: {e}")
+        print(f"ACK reply failed: {type(e).__name__}: {e}")
 
-    # 7) 再把機器人回覆也寫入 GitHub journal
-    try:
-        append_to_daily_journal([
-            f"- [{now_hm()}] Bot: {reply_text}",
-            "",
-        ])
-    except Exception as e:
-        print(f"append bot to journal failed: {type(e).__name__}: {e}")
