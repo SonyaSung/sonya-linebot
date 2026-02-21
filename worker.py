@@ -71,6 +71,7 @@ def _build_reply_text(prompt: str) -> tuple[str, bool]:
 
 
 def process_line_job(payload: dict):
+    print("WORKER GOT JOB", payload.keys())
     chat_type = payload.get("chat_type", "unknown")
     to_id = payload.get("to_id")
     user_text = (payload.get("user_text") or "").strip()
