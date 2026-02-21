@@ -1,7 +1,7 @@
 import os
 
 from redis import Redis
-from rq import Connection, Queue, Worker
+from rq import Queue, Worker
 
 from linebot.v3.messaging import PushMessageRequest, TextMessage
 
@@ -21,11 +21,7 @@ from shared import (
 )
 
 
-REDIS_URL = os.getenv("REDIS_URL") or os.getenv("RAILWAY_REDIS_URL")
-QUEUE_NAME = os.getenv("RQ_QUEUE_NAME", "line")
-
-if not REDIS_URL:
-    raise RuntimeError("Missing REDIS_URL (or RAILWAY_REDIS_URL)")
+QUEUE_NAME = os.environ.get("RQ_QUEUE", "default")
 
 
 def _build_reply_text(prompt: str) -> tuple[str, bool]:
@@ -72,6 +68,7 @@ def _build_reply_text(prompt: str) -> tuple[str, bool]:
         return AI_BUSY_TRANSLATION_MESSAGE, True
 
     return gemini_reply(prompt), True
+
 
 def process_line_job(payload: dict):
     chat_type = payload.get("chat_type", "unknown")
@@ -125,9 +122,17 @@ def process_line_job(payload: dict):
 
 
 if __name__ == "__main__":
-    redis_conn = Redis.from_url(REDIS_URL)
+    redis_url = (
+        os.environ.get("REDIS_URL")
+        or os.environ.get("RAILWAY_REDIS_URL")
+        or "redis://localhost:6379/0"
+    )
+
+    redis_conn = Redis.from_url(redis_url)
+
     queue = Queue(QUEUE_NAME, connection=redis_conn)
-    print(f"worker boot queue={QUEUE_NAME}")
-    with Connection(redis_conn):
-        worker = Worker([queue])
-        worker.work()
+
+    print(f"Worker starting: queue={QUEUE_NAME} redis={redis_url}")
+
+    worker = Worker([queue], connection=redis_conn)
+    worker.work()
