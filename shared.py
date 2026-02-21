@@ -212,12 +212,26 @@ def call_gemini(prompt: str, system_instruction: str | None = None) -> str | Non
         contents = system_instruction + "\n\n" + prompt
 
     try:
-        resp = genai_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=contents
-        )
+        # Try modern SDK with GenerateContentConfig
+        try:
+            from google.genai.types import GenerateContentConfig
+            config = GenerateContentConfig(
+                temperature=1.0,
+                max_output_tokens=4096,
+            )
+            resp = genai_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=contents,
+                config=config
+            )
+        except (ImportError, TypeError):
+            # Fall back to older SDK or simpler interface
+            resp = genai_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=contents
+            )
 
-        return resp.text
+        return resp.text if resp and resp.text else "No response from AI."
 
     except Exception as e:
         print(f"GEMINI_FAIL {type(e).__name__}:{e}", flush=True)
